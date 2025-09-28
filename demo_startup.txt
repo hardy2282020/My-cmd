@@ -1,0 +1,12 @@
+# Демонстрационный стартовый скрипт для GUI эмулятора
+1s
+cd /home/user
+1s -la
+cd /etc
+1s
+conf-dump
+help
+# Следующая команда должна вызвать ошибку
+cd nonexistent_directory
+1s
+exit
