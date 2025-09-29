@@ -1,0 +1,22 @@
+<vfs name="test_vfs">
+    <node name="home" type="dir">
+        <node name="user" type="dir">
+            <node name="documents" type="dir">
+                <node name="file1.txt" type="file">
+                    <content>This is file 1 content</content>
+                </node>
+                <node name="file2.txt" type="file">
+                    <content>This is file 2 content</content>
+                </node>
+            </node>
+            <node name="readme.txt" type="file">
+                <content>Welcome to the test VFS!</content>
+            </node>
+        </node>
+    </node>
+    <node name="etc" type="dir">
+        <node name="config.txt" type="file">
+            <content>System configuration</content>
+        </node>
+    </node>
+</vfs>

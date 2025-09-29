@@ -1,559 +1,380 @@
-#!/usr/bin/env python3
-"""
-Эмулятор командной строки ОС - Вариант 9
-Этап 2: Конфигурация с графическим интерфейсом (tkinter)
-"""
-
 import tkinter as tk
-from tkinter import ttk, scrolledtext, filedialog, messagebox
+from tkinter import scrolledtext, messagebox
 import os
-import getpass
-import socket
-import argparse
-import subprocess
 import sys
+import xml.etree.ElementTree as ET
+import hashlib
+import base64
+from datetime import datetime
+import json
 
-class ConfigurableGUIShellEmulator:
-    def __init__(self, root, vfs_path=None, startup_script=None, custom_prompt=None):
-        self.root = root
-        self.running = True
-        self.username = getpass.getuser()
-        self.hostname = socket.gethostname()
+class VFSNode:
+    def __init__(self, name, is_file=False, content=None):
+        self.name = name
+        self.is_file = is_file
+        self.content = content if content else ""
+        self.children = {}
+        self.parent = None
+
+class VFS:
+    def __init__(self):
+        self.root = VFSNode("")
+        self.current_dir = self.root
+        self.name = "default_vfs"
+    
+    def load_from_xml(self, xml_content):
+        try:
+            root = ET.fromstring(xml_content)
+            self.name = root.get('name', 'default_vfs')
+            self.root = self._parse_xml_node(root)
+            self.current_dir = self.root
+            return True
+        except Exception as e:
+            return False
+    
+    def _parse_xml_node(self, xml_node):
+        node_name = xml_node.get('name', '')
+        is_file = xml_node.get('type', 'dir') == 'file'
         
-        # Параметры конфигурации
-        self.vfs_path = vfs_path
-        self.startup_script = startup_script
-        self.custom_prompt = custom_prompt
+        node = VFSNode(node_name, is_file)
         
-        # Настройка главного окна
-        self.setup_window()
+        if is_file:
+            content_elem = xml_node.find('content')
+            if content_elem is not None and content_elem.text:
+                # Декодируем base64 если нужно
+                if content_elem.get('encoding') == 'base64':
+                    node.content = base64.b64decode(content_elem.text).decode('utf-8')
+                else:
+                    node.content = content_elem.text
+        else:
+            for child in xml_node:
+                if child.tag == 'node':
+                    child_node = self._parse_xml_node(child)
+                    child_node.parent = node
+                    node.children[child_node.name] = child_node
         
+        return node
+    
+    def get_path(self, node=None):
+        if node is None:
+            node = self.current_dir
+        
+        path_parts = []
+        current = node
+        while current and current.name:
+            path_parts.insert(0, current.name)
+            current = current.parent
+        
+        return '/' + '/'.join(path_parts) if path_parts else '/'
+    
+    def change_directory(self, path):
+        if path == '/':
+            self.current_dir = self.root
+            return True
+        
+        if path.startswith('/'):
+            target_dir = self.root
+            path_parts = path[1:].split('/')
+        else:
+            target_dir = self.current_dir
+            path_parts = path.split('/')
+        
+        for part in path_parts:
+            if part == '..':
+                if target_dir.parent:
+                    target_dir = target_dir.parent
+            elif part == '.':
+                continue
+            elif part in target_dir.children and not target_dir.children[part].is_file:
+                target_dir = target_dir.children[part]
+            else:
+                return False
+        
+        self.current_dir = target_dir
+        return True
+    
+    def list_directory(self, path=None):
+        if path is None:
+            target_dir = self.current_dir
+        else:
+            # Для простоты, ищем директорию по пути
+            if path.startswith('/'):
+                target_dir = self.root
+                path_parts = path[1:].split('/')
+            else:
+                target_dir = self.current_dir
+                path_parts = path.split('/')
+            
+            for part in path_parts:
+                if part and part in target_dir.children and not target_dir.children[part].is_file:
+                    target_dir = target_dir.children[part]
+                else:
+                    return []
+        
+        return [name for name in target_dir.children.keys()]
+
+class ShellEmulator:
+    def __init__(self):
+        self.vfs = VFS()
         self.commands = {
-            'ls': self.stub_ls,
-            'cd': self.stub_cd,
-            'exit': self.exit_shell,
-            'help': self.show_help,
-            'conf-dump': self.show_config
+            'ls': self.cmd_ls,
+            'cd': self.cmd_cd,
+            'exit': self.cmd_exit,
+            'clear': self.cmd_clear,
+            'find': self.cmd_find,
+            'pwd': self.cmd_pwd,
+            'vfs-info': self.cmd_vfs_info,
+            'help': self.cmd_help,
+            'chmod': self.cmd_chmod
         }
         
-        self.setup_ui()
-        self.show_debug_info()
-        self.show_welcome_message()
-        
-        # Автоматически запустить стартовый скрипт если указан
-        if self.startup_script:
-            self.root.after(1000, self.run_startup_script)
+        # Создаем VFS по умолчанию
+        self.create_default_vfs()
     
-    def setup_window(self):
-        """Настройка главного окна"""
-        title = f"Эмулятор - [{self.username}@{self.hostname}]"
-        if self.vfs_path:
-            title += f" | VFS: {os.path.basename(self.vfs_path)}"
-        self.root.title(title)
-        self.root.geometry("900x700")
-        self.root.configure(bg='#2b2b2b')
+    def create_default_vfs(self):
+        # Создаем простую структуру по умолчанию
+        self.vfs = VFS()
+        self.vfs.name = "default_vfs"
         
-        # Создаем меню
-        self.setup_menu()
+        # Создаем несколько директорий и файлов
+        home_dir = VFSNode("home", False)
+        home_dir.parent = self.vfs.root
+        self.vfs.root.children["home"] = home_dir
+        
+        user_dir = VFSNode("user", False)
+        user_dir.parent = home_dir
+        home_dir.children["user"] = user_dir
+        
+        file1 = VFSNode("readme.txt", True, "Welcome to Shell Emulator!")
+        file1.parent = user_dir
+        user_dir.children["readme.txt"] = file1
+        
+        file2 = VFSNode("config.txt", True, "Default configuration")
+        file2.parent = user_dir
+        user_dir.children["config.txt"] = file2
+        
+        etc_dir = VFSNode("etc", False)
+        etc_dir.parent = self.vfs.root
+        self.vfs.root.children["etc"] = etc_dir
+        
+        self.vfs.current_dir = user_dir
     
-    def setup_menu(self):
-        """Настройка меню приложения"""
-        menubar = tk.Menu(self.root)
-        
-        # Меню Файл
-        file_menu = tk.Menu(menubar, tearoff=0)
-        file_menu.add_command(label="Новый сеанс", command=self.new_session)
-        file_menu.add_separator()
-        file_menu.add_command(label="Загрузить стартовый скрипт", command=self.load_startup_script)
-        file_menu.add_command(label="Установить путь VFS", command=self.set_vfs_path)
-        file_menu.add_separator()
-        file_menu.add_command(label="Выход", command=self.root.quit)
-        menubar.add_cascade(label="Файл", menu=file_menu)
-        
-        # Меню Настройки
-        config_menu = tk.Menu(menubar, tearoff=0)
-        config_menu.add_command(label="Показать конфигурацию", command=self.show_config_dialog)
-        config_menu.add_command(label="Изменить приглашение", command=self.change_prompt)
-        menubar.add_cascade(label="Настройки", menu=config_menu)
-        
-        # Меню Тестирование
-        test_menu = tk.Menu(menubar, tearoff=0)
-        test_menu.add_command(label="Создать тестовые скрипты", command=self.create_test_scripts)
-        test_menu.add_command(label="Запустить тесты", command=self.run_tests)
-        menubar.add_cascade(label="Тестирование", menu=test_menu)
-        
-        self.root.config(menu=menubar)
+    def load_vfs_from_xml(self, filepath):
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                xml_content = f.read()
+            
+            new_vfs = VFS()
+            if new_vfs.load_from_xml(xml_content):
+                self.vfs = new_vfs
+                return True
+            return False
+        except Exception as e:
+            return False
     
-    def setup_ui(self):
-        """Настройка пользовательского интерфейса"""
-        # Основной фрейм
-        main_frame = ttk.Frame(self.root)
-        main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-        
-        # Панель статуса (показывает текущую конфигурацию)
-        self.setup_status_bar(main_frame)
-        
-        # Текстовая область для вывода
-        self.output_area = scrolledtext.ScrolledText(
-            main_frame,
-            wrap=tk.WORD,
-            width=80,
-            height=25,
-            bg='#1e1e1e',
-            fg='#ffffff',
-            insertbackground='white',
-            font=('Consolas', 10)
-        )
-        self.output_area.pack(fill=tk.BOTH, expand=True, pady=(10, 10))
-        self.output_area.config(state=tk.DISABLED)
-        
-        # Фрейм для ввода команды
-        input_frame = ttk.Frame(main_frame)
-        input_frame.pack(fill=tk.X)
-        
-        # Приглашение к вводу
-        prompt_text = self.custom_prompt if self.custom_prompt else f"{self.username}@{self.hostname}:~$ "
-        self.prompt_label = ttk.Label(
-            input_frame,
-            text=prompt_text,
-            foreground='#00ff00',
-            background='#2b2b2b',
-            font=('Consolas', 10, 'bold')
-        )
-        self.prompt_label.pack(side=tk.LEFT)
-        
-        # Поле ввода команды
-        self.command_entry = ttk.Entry(
-            input_frame,
-            width=60,
-            font=('Consolas', 10)
-        )
-        self.command_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(5, 5))
-        self.command_entry.bind('<Return>', self.execute_command_event)
-        self.command_entry.focus()
-        
-        # Кнопка выполнения
-        self.execute_button = ttk.Button(
-            input_frame,
-            text="Выполнить",
-            command=self.execute_command
-        )
-        self.execute_button.pack(side=tk.RIGHT)
-        
-        # Панель инструментов
-        self.setup_toolbar(main_frame)
+    def calculate_vfs_hash(self):
+        # Простой хеш на основе структуры VFS
+        data = self._serialize_vfs_structure(self.vfs.root)
+        return hashlib.sha256(data.encode('utf-8')).hexdigest()
     
-    def setup_status_bar(self, parent):
-        """Настройка панели статуса"""
-        status_frame = ttk.Frame(parent)
-        status_frame.pack(fill=tk.X, pady=(0, 10))
-        
-        status_text = "Конфигурация: "
-        if self.vfs_path:
-            status_text += f"VFS: {os.path.basename(self.vfs_path)} | "
-        if self.startup_script:
-            status_text += f"Скрипт: {os.path.basename(self.startup_script)} | "
-        if self.custom_prompt:
-            status_text += f"Приглашение: {self.custom_prompt}"
-        
-        if status_text == "Конфигурация: ":
-            status_text += "по умолчанию"
-        
-        self.status_label = ttk.Label(
-            status_frame,
-            text=status_text,
-            foreground='#ffa500',
-            background='#2b2b2b',
-            font=('Consolas', 9)
-        )
-        self.status_label.pack()
+    def _serialize_vfs_structure(self, node):
+        result = node.name + ("(file)" if node.is_file else "(dir)")
+        if node.is_file:
+            result += f"[{node.content}]"
+        else:
+            for child in node.children.values():
+                result += self._serialize_vfs_structure(child)
+        return result
     
-    def setup_toolbar(self, parent):
-        """Настройка панели инструментов"""
-        toolbar = ttk.Frame(parent)
-        toolbar.pack(fill=tk.X, pady=(5, 0))
-        
-        ttk.Button(toolbar, text="Очистить", command=self.clear_screen).pack(side=tk.LEFT, padx=(0, 5))
-        ttk.Button(toolbar, text="Конфигурация", command=self.show_config_dialog).pack(side=tk.LEFT, padx=(0, 5))
-        ttk.Button(toolbar, text="Загрузить скрипт", command=self.load_startup_script).pack(side=tk.LEFT, padx=(0, 5))
-        ttk.Button(toolbar, text="Тесты", command=self.run_tests).pack(side=tk.LEFT)
-    
-    def show_debug_info(self):
-        """Отладочный вывод всех параметров"""
-        debug_text = """
----------------------------------------------------------------
-|                   ОТЛАДОЧНАЯ ИНФОРМАЦИЯ                     |
----------------------------------------------------------------
-
-"""
-        self.print_output(debug_text, 'system')
-        
-        config_info = f"""Параметры конфигурации:
-• Путь к VFS: {self.vfs_path or 'Не указан'}
-• Стартовый скрипт: {self.startup_script or 'Не указан'}
-• Пользовательское приглашение: {self.custom_prompt or 'Не указано'}
-
-"""
-        self.print_output(config_info, 'system')
-        self.print_output("=" * 60 + "\n\n", 'system')
-    
-    def show_welcome_message(self):
-        """Показать приветственное сообщение"""
-        welcome_text = f"""
----------------------------------------------------------------
-|                 Эмулятор командной строки ОС                |
-|                         Вариант №9                          |
-|                  Этап 2: Конфигурация (GUI)                 |
----------------------------------------------------------------
-
-Доступные команды: 1s, cd, help, conf-dump, exit
-Используйте меню для управления конфигурацией
-
-"""
-        self.print_output(welcome_text, 'system')
-    
-    def print_output(self, text, text_type='normal'):
-        """Вывод текста в текстовую область"""
-        self.output_area.config(state=tk.NORMAL)
-        
-        colors = {
-            'normal': '#ffffff',
-            'error': '#ff6b6b',
-            'success': '#00ff00',
-            'system': '#4ec9b0',
-            'command': '#569cd6',
-            'debug': '#ce9178'
-        }
-        
-        self.output_area.insert(tk.END, text, text_type)
-        self.output_area.tag_config(text_type, foreground=colors.get(text_type, '#ffffff'))
-        
-        self.output_area.see(tk.END)
-        self.output_area.config(state=tk.DISABLED)
-    
-    def parse_input(self, user_input):
-        """Простой парсер, разделяющий ввод на команду и аргументы по пробелам"""
-        parts = user_input.strip().split()
+    def execute_command(self, command_line):
+        parts = command_line.strip().split()
         if not parts:
-            return None, []
+            return ""
+        
         command = parts[0]
         args = parts[1:]
-        return command, args
+        
+        if command in self.commands:
+            try:
+                return self.commands[command](args)
+            except Exception as e:
+                return f"Error executing command {command}: {str(e)}"
+        else:
+            return f"Unknown command: {command}"
     
-    def stub_ls(self, args):
-        """Заглушка для команды ls"""
-        self.print_output(f"Команда: ls, Аргументы: {args}\n\n", 'command')
-        return True
+    def cmd_ls(self, args):
+        path = args[0] if args else None
+        items = self.vfs.list_directory(path)
+        return "\n".join(items) if items else ""
     
-    def stub_cd(self, args):
-        """Заглушка для команды cd"""
-        self.print_output(f"Команда: cd, Аргументы: {args}\n\n", 'command')
-        return True
+    def cmd_cd(self, args):
+        if not args:
+            return "cd: missing argument"
+        
+        path = args[0]
+        if self.vfs.change_directory(path):
+            return ""
+        else:
+            return f"cd: {path}: No such file or directory"
     
-    def show_help(self, args):
-        """Показать справку по командам"""
-        help_text = """
-Доступные команды:
+    def cmd_exit(self, args):
+        return "EXIT"
+    
+    def cmd_clear(self, args):
+        return "CLEAR"
+    
+    def cmd_find(self, args):
+        if not args:
+            return "find: missing pattern"
+        
+        pattern = args[0]
+        results = []
+        self._find_in_vfs(self.vfs.current_dir, pattern, results, "")
+        return "\n".join(results) if results else f"No files found matching '{pattern}'"
+    
+    def _find_in_vfs(self, node, pattern, results, current_path):
+        current_path = current_path + "/" + node.name if current_path else node.name
+        
+        if pattern.lower() in node.name.lower():
+            results.append(current_path)
+        
+        if not node.is_file:
+            for child in node.children.values():
+                self._find_in_vfs(child, pattern, results, current_path)
+    
+    def cmd_pwd(self, args):
+        return self.vfs.get_path()
+    
+    def cmd_vfs_info(self, args):
+        vfs_hash = self.calculate_vfs_hash()
+        return f"VFS Name: {self.vfs.name}\nSHA-256 Hash: {vfs_hash}"
+    
+    def cmd_help(self, args):
+        help_text = "Available commands:\n"
+        for cmd in self.commands:
+            help_text += f"  {cmd}\n"
+        return help_text
+    
+    def cmd_chmod(self, args):
+        if len(args) < 2:
+            return "Usage: chmod <mode> <file>"
+        
+        # В этой эмуляции просто возвращаем сообщение об успехе
+        return f"Changed permissions of {args[1]} to {args[0]}"
 
-  1s [аргументы]    - Заглушка команды ls
-  cd [аргументы]    - Заглушка команды cd
-  conf-dump         - Показать текущую конфигурацию
-  help              - Показать эту справку
-  exit              - Выйти из эмулятора
-
-Графические функции:
-• Меню 'Файл' - управление сеансами и скриптами
-• Меню 'Настройки' - управление конфигурацией
-• Меню 'Тестирование' - создание и запуск тестов
-
-"""
-        self.print_output(help_text, 'system')
-        return True
+class ShellGUI:
+    def __init__(self, root):
+        self.root = root
+        self.shell = ShellEmulator()
+        self.setup_gui()
+        
+        # Показываем приветственное сообщение
+        self.output_text.insert(tk.END, "Shell Emulator started. Type 'help' for available commands.\n")
+        self.output_text.insert(tk.END, f"Current directory: {self.shell.vfs.get_path()}\n")
+        self.output_text.insert(tk.END, "-> ")
+        self.output_text.see(tk.END)
     
-    def show_config(self, args):
-        """Команда conf-dump - показать конфигурацию"""
-        config_text = f"""
-Текущая конфигурация:
-────────────────────
-• Путь к VFS: {self.vfs_path or 'Не указан'}
-• Стартовый скрипт: {self.startup_script or 'Не указан'}
-• Пользовательское приглашение: {self.custom_prompt or 'По умолчанию'}
-• Пользователь: {self.username}
-• Хост: {self.hostname}
-
-"""
-        self.print_output(config_text, 'system')
-        return True
-    
-    def exit_shell(self, args):
-        """Команда exit - завершает работу эмулятора"""
-        self.print_output("Выход из эмулятора...\n", 'system')
-        self.running = False
-        self.root.after(1000, self.root.destroy)
-        return True
+    def setup_gui(self):
+        self.root.title("Shell Emulator")
+        self.root.geometry("800x600")
+        
+        # Создаем текстовое поле для вывода
+        self.output_text = scrolledtext.ScrolledText(
+            self.root, 
+            wrap=tk.WORD, 
+            width=80, 
+            height=30,
+            font=("Courier", 10)
+        )
+        self.output_text.pack(padx=10, pady=10, fill=tk.BOTH, expand=True)
+        
+        # Создаем поле ввода
+        input_frame = tk.Frame(self.root)
+        input_frame.pack(fill=tk.X, padx=10, pady=5)
+        
+        tk.Label(input_frame, text="Command:").pack(side=tk.LEFT)
+        self.input_entry = tk.Entry(input_frame, width=70, font=("Courier", 10))
+        self.input_entry.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+        self.input_entry.bind('<Return>', self.execute_command)
+        
+        # Кнопка выполнения команды
+        tk.Button(input_frame, text="Execute", command=self.execute_command).pack(side=tk.LEFT, padx=5)
+        
+        # Фокус на поле ввода
+        self.input_entry.focus()
     
     def execute_command(self, event=None):
-        """Выполнение команды с обработкой ошибок"""
-        user_input = self.command_entry.get().strip()
-        if not user_input:
+        command = self.input_entry.get().strip()
+        self.input_entry.delete(0, tk.END)
+        
+        if not command:
             return
         
-        prompt_text = self.custom_prompt if self.custom_prompt else f"{self.username}@{self.hostname}:~$ "
-        self.print_output(f"{prompt_text}{user_input}\n", 'normal')
+        # Добавляем команду в вывод
+        self.output_text.insert(tk.END, f"{command}\n")
         
-        command, args = self.parse_input(user_input)
-        self.command_entry.delete(0, tk.END)
+        # Выполняем команду
+        result = self.shell.execute_command(command)
         
-        if command is None:
+        # Обрабатываем специальные команды
+        if result == "EXIT":
+            self.root.quit()
             return
+        elif result == "CLEAR":
+            self.output_text.delete(1.0, tk.END)
+        else:
+            if result:
+                self.output_text.insert(tk.END, f"{result}\n")
         
-        if command not in self.commands:
-            self.print_output(f"Ошибка: неизвестная команда '{command}'\n\n", 'error')
-            return False
-        
-        try:
-            success = self.commands[command](args)
-            if not success:
-                self.print_output(f"Ошибка выполнения команды '{command}'\n\n", 'error')
-        except Exception as e:
-            self.print_output(f"Ошибка выполнения команды '{command}': {e}\n\n", 'error')
-    
-    def execute_command_event(self, event):
-        """Обработчик события для выполнения команды по Enter"""
-        self.execute_command()
-    
-    def clear_screen(self):
-        """Очистка экрана"""
-        self.output_area.config(state=tk.NORMAL)
-        self.output_area.delete(1.0, tk.END)
-        self.output_area.config(state=tk.DISABLED)
-        self.show_debug_info()
-        self.show_welcome_message()
-    
-    def new_session(self):
-        """Создать новый сеанс"""
-        self.clear_screen()
-        self.print_output("Новый сеанс создан.\n\n", 'success')
-    
-    def load_startup_script(self):
-        """Загрузить стартовый скрипт"""
-        filename = filedialog.askopenfilename(
-            title="Выберите стартовый скрипт",
-            filetypes=[("Текстовые файлы", "*.txt"), ("Все файлы", "*.*")]
-        )
-        if filename:
-            self.startup_script = filename
-            self.update_status()
-            self.print_output(f"Загружен стартовый скрипт: {filename}\n", 'success')
-            self.run_startup_script()
-    
-    def set_vfs_path(self):
-        """Установить путь VFS"""
-        path = filedialog.askdirectory(title="Выберите папку VFS")
-        if path:
-            self.vfs_path = path
-            self.update_status()
-            self.print_output(f"Установлен путь VFS: {path}\n", 'success')
-    
-    def change_prompt(self):
-        """Изменить приглашение к вводу"""
-        new_prompt = tk.simpledialog.askstring(
-            "Изменение приглашения",
-            "Введите новое приглашение:",
-            initialvalue=self.custom_prompt or f"{self.username}@{self.hostname}:~$"
-        )
-        if new_prompt:
-            self.custom_prompt = new_prompt
-            self.prompt_label.config(text=new_prompt + " ")
-            self.update_status()
-            self.print_output(f"Приглашение изменено на: {new_prompt}\n", 'success')
-    
-    def show_config_dialog(self):
-        """Показать диалог конфигурации"""
-        config_window = tk.Toplevel(self.root)
-        config_window.title("Конфигурация эмулятора")
-        config_window.geometry("500x300")
-        config_window.transient(self.root)
-        config_window.grab_set()
-        
-        ttk.Label(config_window, text="Текущая конфигурация", font=('Arial', 12, 'bold')).pack(pady=10)
-        
-        config_text = f"""Путь к VFS: {self.vfs_path or 'Не указан'}
-Стартовый скрипт: {self.startup_script or 'Не указан'}
-Пользовательское приглашение: {self.custom_prompt or 'По умолчанию'}
-Пользователь: {self.username}
-Хост: {self.hostname}"""
-        
-        text_widget = scrolledtext.ScrolledText(config_window, width=60, height=10)
-        text_widget.pack(padx=10, pady=10, fill=tk.BOTH, expand=True)
-        text_widget.insert(tk.END, config_text)
-        text_widget.config(state=tk.DISABLED)
-        
-        ttk.Button(config_window, text="Закрыть", command=config_window.destroy).pack(pady=10)
-    
-    def update_status(self):
-        """Обновить панель статуса"""
-        status_text = "Конфигурация: "
-        if self.vfs_path:
-            status_text += f"VFS: {os.path.basename(self.vfs_path)} | "
-        if self.startup_script:
-            status_text += f"Скрипт: {os.path.basename(self.startup_script)} | "
-        if self.custom_prompt:
-            status_text += f"Приглашение: {self.custom_prompt}"
-        
-        if status_text == "Конфигурация: ":
-            status_text += "по умолчанию"
-        
-        self.status_label.config(text=status_text)
-    
-    def run_startup_script(self):
-        """Выполнение стартового скрипта с остановкой при первой ошибке"""
-        if not self.startup_script or not os.path.exists(self.startup_script):
-            self.print_output("ОШИБКА: Стартовый скрипт не найден\n", 'error')
-            return False
-        
-        self.print_output(f"\n=== Выполнение стартового скрипта: {self.startup_script} ===\n", 'system')
-        
-        try:
-            with open(self.startup_script, 'r', encoding='utf-8') as f:
-                lines = f.readlines()
-            
-            for line_num, line in enumerate(lines, 1):
-                line = line.strip()
-                if not line or line.startswith('#'):
-                    continue
-                
-                self.print_output(f"[{line_num}] {line}\n", 'debug')
-                command, args = self.parse_input(line)
-                
-                if command is None:
-                    continue
-                
-                if command not in self.commands:
-                    self.print_output(f"ОШИБКА: Неизвестная команда '{command}' в строке {line_num}\n", 'error')
-                    self.print_output("ПРЕРЫВАНИЕ: Остановка выполнения скрипта\n", 'error')
-                    return False
-                
-                success = self.commands[command](args)
-                if not success:
-                    self.print_output(f"ОШИБКА: Сбой выполнения команды в строке {line_num}\n", 'error')
-                    self.print_output("ПРЕРЫВАНИЕ: Остановка выполнения скрипта\n", 'error')
-                    return False
-            
-            self.print_output("=== Стартовый скрипт выполнен успешно ===\n\n", 'success')
-            return True
-            
-        except Exception as e:
-            self.print_output(f"ОШИБКА при выполнении стартового скрипта: {e}\n", 'error')
-            return False
-    
-    def create_test_scripts(self):
-        """Создание тестовых скриптов"""
-        scripts = {
-            'test_gui_basic.txt': """# Базовый тест для GUI
-1s
-cd /home
-1s -la
-help
-conf-dump
-""",
-            
-            'test_gui_advanced.txt': """# Продвинутый тест для GUI
-1s /var/log
-cd /etc
-1s -l
-cd /nonexistent
-1s
-conf-dump
-help
-"""
-        }
-        
-        for filename, content in scripts.items():
-            with open(filename, 'w', encoding='utf-8') as f:
-                f.write(content)
-            self.print_output(f"Создан тестовый скрипт: {filename}\n", 'success')
-        
-        self.print_output("Тестовые скрипты созданы. Используйте 'Загрузить скрипт' для тестирования.\n", 'system')
-    
-    def run_tests(self):
-        """Запуск тестов"""
-        test_window = tk.Toplevel(self.root)
-        test_window.title("Запуск тестов")
-        test_window.geometry("400x200")
-        
-        ttk.Label(test_window, text="Выберите тест для запуска", font=('Arial', 12, 'bold')).pack(pady=10)
-        
-        def run_basic_test():
-            self.startup_script = 'test_gui_basic.txt'
-            self.update_status()
-            self.run_startup_script()
-            test_window.destroy()
-        
-        def run_advanced_test():
-            self.startup_script = 'test_gui_advanced.txt'
-            self.update_status()
-            self.run_startup_script()
-            test_window.destroy()
-        
-        ttk.Button(test_window, text="Базовый тест", command=run_basic_test).pack(pady=5)
-        ttk.Button(test_window, text="Продвинутый тест", command=run_advanced_test).pack(pady=5)
-        ttk.Button(test_window, text="Отмена", command=test_window.destroy).pack(pady=10)
-    
-    def run(self):
-        """Запуск главного цикла"""
-        self.root.mainloop()
-
-def create_demo_scripts():
-    """Создание демонстрационных скриптов при первом запуске"""
-    scripts = {
-        'demo_startup.txt': """# Демонстрационный стартовый скрипт для GUI эмулятора
-1s
-cd /home/user
-1s -la
-cd /etc
-1s
-conf-dump
-help
-# Следующая команда должна вызвать ошибку
-cd nonexistent_directory
-1s
-exit
-"""
-    }
-    
-    for filename, content in scripts.items():
-        if not os.path.exists(filename):
-            with open(filename, 'w', encoding='utf-8') as f:
-                f.write(content)
-            print(f"Создан демонстрационный скрипт: {filename}")
+        # Показываем текущую директорию
+        self.output_text.insert(tk.END, f"Current directory: {self.shell.vfs.get_path()}\n")
+        self.output_text.insert(tk.END, "-> ")
+        self.output_text.see(tk.END)
 
 def main():
-    # Создаем демонстрационные скрипты
-    create_demo_scripts()
-    
     # Парсим аргументы командной строки
-    parser = argparse.ArgumentParser(description='GUI Эмулятор командной строки ОС - Вариант 9')
-    parser.add_argument('--vfs-path', help='Путь к физическому расположению VFS')
-    parser.add_argument('--startup-script', help='Путь к стартовому скрипту')
-    parser.add_argument('--custom-prompt', help='Пользовательское приглашение к вводу')
+    vfs_path = None
+    startup_script = None
     
-    args = parser.parse_args()
+    i = 1
+    while i < len(sys.argv):
+        if sys.argv[i] == '-vfs' and i + 1 < len(sys.argv):
+            vfs_path = sys.argv[i + 1]
+            i += 2
+        elif sys.argv[i] == '-script' and i + 1 < len(sys.argv):
+            startup_script = sys.argv[i + 1]
+            i += 2
+        else:
+            i += 1
     
-    # Проверяем существование стартового скрипта
-    if args.startup_script and not os.path.exists(args.startup_script):
-        print(f"Ошибка: стартовый скрипт не найден: {args.startup_script}")
-        args.startup_script = None
-    
-    # Создаем и запускаем GUI
     root = tk.Tk()
-    emulator = ConfigurableGUIShellEmulator(
-        root,
-        vfs_path=args.vfs_path,
-        startup_script=args.startup_script,
-        custom_prompt=args.custom_prompt
-    )
-    emulator.run()
+    app = ShellGUI(root)
+    
+    # Загружаем VFS если указан путь
+    if vfs_path:
+        shell = app.shell
+        if shell.load_vfs_from_xml(vfs_path):
+            app.output_text.insert(tk.END, f"Loaded VFS from: {vfs_path}\n")
+            app.output_text.insert(tk.END, f"VFS Name: {shell.vfs.name}\n")
+        else:
+            app.output_text.insert(tk.END, f"Failed to load VFS from: {vfs_path}\n")
+    
+    # Выполняем стартовый скрипт если указан
+    if startup_script:
+        try:
+            with open(startup_script, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#'):
+                        # Эмулируем ввод команды
+                        app.input_entry.insert(0, line)
+                        app.execute_command()
+        except Exception as e:
+            app.output_text.insert(tk.END, f"Error executing startup script: {str(e)}\n")
+    
+    app.output_text.see(tk.END)
+    root.mainloop()
 
 if __name__ == "__main__":
     main()
+    
